@@ -2,16 +2,25 @@ package k8sutils
 
 import (
 	"context"
+	"strconv"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util/maps"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// External-master environment variables consumed by the bootstrap agent
+// (see internal/agent/bootstrap/redis/config.go).
+const (
+	envExternalMasterHost = "EXTERNAL_MASTER_HOST"
+	envExternalMasterPort = "EXTERNAL_MASTER_PORT"
 )
 
 // CreateReplicationService method will create replication service for Redis
@@ -56,9 +65,14 @@ func CreateReplicationService(ctx context.Context, cr *rrvb2.RedisReplication, c
 		log.FromContext(ctx).Error(err, "Cannot create additional service for Redis Replication")
 		return err
 	}
-	if err := CreateOrUpdateService(ctx, cr.Namespace, masterObjectMetaInfo, redisReplicationAsOwner(cr), disableMetrics, false, "ClusterIP", common.RedisPort, cl); err != nil {
-		log.FromContext(ctx).Error(err, "Cannot create master service for Redis")
-		return err
+	// In slave-only (external-master) mode there is no local master pod, so
+	// the master role-selector ClusterIP service would never have endpoints.
+	// Skip its creation to avoid confusing clients.
+	if !cr.HasExternalMaster() {
+		if err := CreateOrUpdateService(ctx, cr.Namespace, masterObjectMetaInfo, redisReplicationAsOwner(cr), disableMetrics, false, "ClusterIP", common.RedisPort, cl); err != nil {
+			log.FromContext(ctx).Error(err, "Cannot create master service for Redis")
+			return err
+		}
 	}
 	if err := CreateOrUpdateService(ctx, cr.Namespace, replicaObjectMetaInfo, redisReplicationAsOwner(cr), disableMetrics, false, "ClusterIP", common.RedisPort, cl); err != nil {
 		log.FromContext(ctx).Error(err, "Cannot create replica service for Redis")
@@ -163,6 +177,20 @@ func generateRedisReplicationContainerParams(cr *rrvb2.RedisReplication) contain
 	}
 	if cr.Spec.EnvVars != nil {
 		containerProp.EnvVars = cr.Spec.EnvVars
+	}
+	// In slave-only mode, advertise the external master endpoint to every pod
+	// (and to the bootstrap init-config container) via env vars consumed by
+	// the bootstrap agent.
+	if cr.HasExternalMaster() {
+		extEnvs := []corev1.EnvVar{
+			{Name: envExternalMasterHost, Value: cr.Spec.ExternalMaster.Host},
+			{Name: envExternalMasterPort, Value: strconv.Itoa(int(cr.ExternalMasterPort()))},
+		}
+		merged := append([]corev1.EnvVar{}, extEnvs...)
+		if containerProp.EnvVars != nil {
+			merged = append(merged, *containerProp.EnvVars...)
+		}
+		containerProp.EnvVars = &merged
 	}
 	if cr.Spec.Storage != nil {
 		containerProp.AdditionalVolume = cr.Spec.Storage.VolumeMount.Volume

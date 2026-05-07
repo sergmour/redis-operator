@@ -814,6 +814,85 @@ func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interf
 	return ""
 }
 
+// getReplicationMasterFromInfo parses the master_host and master_port fields
+// from a Redis `INFO Replication` response. Returns empty strings if the pod
+// is not configured as a replica.
+func getReplicationMasterFromInfo(info string) (host, port string) {
+	for _, line := range strings.Split(info, "\r\n") {
+		switch {
+		case strings.HasPrefix(line, "master_host:"):
+			host = strings.TrimSpace(strings.TrimPrefix(line, "master_host:"))
+		case strings.HasPrefix(line, "master_port:"):
+			port = strings.TrimSpace(strings.TrimPrefix(line, "master_port:"))
+		}
+	}
+	return host, port
+}
+
+// EnsureExternalMasterReplication walks every pod owned by the
+// RedisReplication StatefulSet and verifies that it is replicating from the
+// configured external master. Any pod that has drifted (wrong master, no
+// master, or accidentally promoted to master) is reconfigured with
+// REPLICAOF <host> <port>.
+//
+// This function is intended to be called only when cr.HasExternalMaster() is
+// true. It assumes the bootstrap config already pinned each pod to the
+// external master at startup; the runtime check guards against drift caused
+// by manual intervention, replication failures, or restarts of an external
+// master with a fresh replication ID.
+func EnsureExternalMasterReplication(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication) error {
+	if !cr.HasExternalMaster() {
+		return nil
+	}
+
+	expectedHost := cr.Spec.ExternalMaster.Host
+	expectedPort := strconv.Itoa(int(cr.ExternalMasterPort()))
+
+	sts, err := GetStatefulSet(ctx, client, cr.GetNamespace(), cr.GetName())
+	if err != nil {
+		return fmt.Errorf("get statefulset for external-master reconcile: %w", err)
+	}
+	replicas := int32(0)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+
+	logger := log.FromContext(ctx)
+	for i := int32(0); i < replicas; i++ {
+		podName := sts.Name + "-" + strconv.Itoa(int(i))
+		redisClient := configureRedisReplicationClient(ctx, client, cr, podName)
+
+		info, err := redisClient.Info(ctx, "Replication").Result()
+		if err != nil {
+			logger.Error(err, "external-master reconcile: failed to read INFO Replication; skipping pod",
+				"pod", podName)
+			redisClient.Close()
+			continue
+		}
+
+		gotHost, gotPort := getReplicationMasterFromInfo(info)
+		if gotHost == expectedHost && gotPort == expectedPort {
+			redisClient.Close()
+			continue
+		}
+
+		logger.Info("external-master reconcile: pod is not replicating from configured master, reissuing REPLICAOF",
+			"pod", podName,
+			"expectedHost", expectedHost, "expectedPort", expectedPort,
+			"observedHost", gotHost, "observedPort", gotPort,
+		)
+		if err := redisClient.SlaveOf(ctx, expectedHost, expectedPort).Err(); err != nil {
+			logger.Error(err, "external-master reconcile: REPLICAOF failed", "pod", podName)
+			redisClient.Close()
+			// Continue with remaining pods; surface the error so the controller
+			// requeues and tries again.
+			return err
+		}
+		redisClient.Close()
+	}
+	return nil
+}
+
 // SetRedisClusterDynamicConfig applies dynamic configuration to each Redis instance in the cluster
 func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
 	// Get dynamic configuration

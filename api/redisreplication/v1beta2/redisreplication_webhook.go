@@ -80,6 +80,38 @@ func (r *RedisReplication) validate(_ *RedisReplication) (admission.Warnings, er
 		}
 	}
 
+	// Validate ExternalMaster configuration.
+	if r.Spec.ExternalMaster != nil {
+		extPath := field.NewPath("spec").Child("externalMaster")
+
+		if r.Spec.ExternalMaster.Host == "" {
+			errors = append(errors, field.Required(
+				extPath.Child("host"),
+				"externalMaster.host must be set when externalMaster is specified",
+			))
+		}
+		if r.Spec.ExternalMaster.Port != nil {
+			p := *r.Spec.ExternalMaster.Port
+			if p < 1 || p > 65535 {
+				errors = append(errors, field.Invalid(
+					extPath.Child("port"),
+					p,
+					"externalMaster.port must be between 1 and 65535",
+				))
+			}
+		}
+
+		// ExternalMaster is mutually exclusive with Sentinel: in slave-only
+		// mode the controller skips all leader-election/failover logic, and
+		// Sentinel-driven failover would conflict with that contract.
+		if r.Spec.Sentinel != nil {
+			errors = append(errors, field.Forbidden(
+				extPath,
+				"spec.externalMaster and spec.sentinel are mutually exclusive",
+			))
+		}
+	}
+
 	if len(errors) == 0 {
 		return nil, nil
 	}

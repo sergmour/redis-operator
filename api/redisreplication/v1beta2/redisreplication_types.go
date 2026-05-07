@@ -31,6 +31,35 @@ type RedisReplicationSpec struct {
 	TopologySpreadConstrains      []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 	HostPort                      *int                              `json:"hostPort,omitempty"`
 	Sentinel                      *Sentinel                         `json:"sentinel,omitempty"`
+	// ExternalMaster, when set, configures all pods of this RedisReplication
+	// to act as read-replicas connecting to a Redis master that lives outside
+	// of this Kubernetes cluster (typically in a primary K8s cluster).
+	// When this field is set:
+	//   - No local master is elected; the controller skips leader-election
+	//     and failover logic.
+	//   - All pods are configured with `replicaof <host> <port>` and
+	//     `replica-read-only yes`.
+	//   - Authentication to the external master uses the password from
+	//     KubernetesConfig.ExistingPasswordSecret (masterauth).
+	//   - When Spec.TLS is also set, the slave-to-master replication link
+	//     uses TLS (`tls-replication yes`).
+	//   - This field is mutually exclusive with Spec.Sentinel.
+	// +optional
+	ExternalMaster *ExternalMasterConfig `json:"externalMaster,omitempty"`
+}
+
+// ExternalMasterConfig defines the static endpoint of a Redis master that
+// lives outside of this Kubernetes cluster.
+type ExternalMasterConfig struct {
+	// Host is the DNS name or IP address of the external Redis master.
+	// +kubebuilder:validation:MinLength=1
+	Host string `json:"host"`
+	// Port is the TCP port of the external Redis master.
+	// Defaults to 6379 when not specified.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port *int32 `json:"port,omitempty"`
 }
 
 type Sentinel struct {

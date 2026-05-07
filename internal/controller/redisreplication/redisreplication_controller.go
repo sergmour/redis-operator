@@ -18,6 +18,7 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -345,6 +346,28 @@ func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisR
 }
 
 func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
+	// Slave-only (external-master) mode: skip all leader-election / failover
+	// logic. Every pod is a read-replica of an external master, so we only
+	// need to verify on each cycle that no pod has drifted away from the
+	// configured external master.
+	if instance.HasExternalMaster() {
+		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.RedisStatefulSet()) {
+			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for redis statefulset to be ready")
+		}
+		if err := k8sutils.EnsureExternalMasterReplication(ctx, r.K8sClient, instance); err != nil {
+			return intctrlutil.RequeueAfter(ctx, time.Second*60, "external-master replication reconcile failed")
+		}
+		// Track desired vs current replica counts so existing dashboards still
+		// work; mismatch metric is intentionally always 0 here because all
+		// pods are slaves and no leader-election size check applies.
+		monitoring.RedisReplicationReplicasSizeMismatch.WithLabelValues(instance.Namespace, instance.Name).Set(0)
+		if instance.Spec.Size != nil {
+			monitoring.RedisReplicationReplicasSizeDesired.WithLabelValues(instance.Namespace, instance.Name).Set(float64(*instance.Spec.Size))
+			monitoring.RedisReplicationReplicasSizeCurrent.WithLabelValues(instance.Namespace, instance.Name).Set(float64(r.GetStatefulSetReplicas(ctx, instance.Namespace, instance.RedisStatefulSet())))
+		}
+		return intctrlutil.Reconciled()
+	}
+
 	if instance.EnableSentinel() {
 		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.SentinelStatefulSet()) {
 			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for sentinel statefulset to be ready")
@@ -434,6 +457,27 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	var err error
 	var realMaster string
 
+	// Slave-only mode: there is no in-cluster master to elect. Force every
+	// pod to the slave role label, expose the external master endpoint via
+	// status, and skip the local master discovery path entirely.
+	if instance.HasExternalMaster() {
+		if err := r.forceSlaveLabels(ctx, instance); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+		if err := r.UpdateRedisReplicationMaster(ctx, instance, instance.ExternalMasterEndpoint()); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+		// Count slaves as the number of pods in the StatefulSet that are up.
+		slaveNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
+		if err != nil {
+			// Don't fail the whole reconcile loop if a transient pod is
+			// unreachable; surface 0 connected and continue.
+			log.FromContext(ctx).Error(err, "external-master mode: failed to enumerate slave pods")
+		}
+		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(len(slaveNodes)))
+		return intctrlutil.Reconciled()
+	}
+
 	masterNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "master")
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
@@ -458,6 +502,38 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	}
 
 	return intctrlutil.Reconciled()
+}
+
+// forceSlaveLabels patches every pod owned by this RedisReplication so that
+// the redis-role label is "slave". Used in external-master mode where the
+// usual INFO-replication-driven role discovery is bypassed.
+func (r *Reconciler) forceSlaveLabels(ctx context.Context, instance *rrvb2.RedisReplication) error {
+	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
+	selector := make([]string, 0, len(labels))
+	for k, v := range labels {
+		selector = append(selector, fmt.Sprintf("%s=%s", k, v))
+	}
+	pods, err := r.K8sClient.CoreV1().Pods(instance.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: strings.Join(selector, ","),
+	})
+	if err != nil {
+		return fmt.Errorf("list pods for slave-label enforcement: %w", err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Labels[common.RedisRoleLabelKey] == common.RedisRoleLabelSlave {
+			continue
+		}
+		patch := []byte(fmt.Sprintf(
+			`[{"op":"add","path":"/metadata/labels/%s","value":"%s"}]`,
+			common.RedisRoleLabelKey, common.RedisRoleLabelSlave,
+		))
+		if _, err := r.K8sClient.CoreV1().Pods(instance.Namespace).Patch(
+			ctx, pod.Name, types.JSONPatchType, patch, metav1.PatchOptions{},
+		); err != nil {
+			return fmt.Errorf("patch slave label on pod %s: %w", pod.Name, err)
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplication, status rrvb2.RedisReplicationStatus) error {

@@ -1192,6 +1192,38 @@ spec:
                   - name
                   type: object
                 type: array
+              externalMaster:
+                description: |-
+                  ExternalMaster, when set, configures all pods of this RedisReplication
+                  to act as read-replicas connecting to a Redis master that lives outside
+                  of this Kubernetes cluster (typically in a primary K8s cluster).
+                  When this field is set:
+                    - No local master is elected; the controller skips leader-election
+                      and failover logic.
+                    - All pods are configured with `replicaof <host> <port>` and
+                      `replica-read-only yes`.
+                    - Authentication to the external master uses the password from
+                      KubernetesConfig.ExistingPasswordSecret (masterauth).
+                    - When Spec.TLS is also set, the slave-to-master replication link
+                      uses TLS (`tls-replication yes`).
+                    - This field is mutually exclusive with Spec.Sentinel.
+                properties:
+                  host:
+                    description: Host is the DNS name or IP address of the external
+                      Redis master.
+                    minLength: 1
+                    type: string
+                  port:
+                    description: |-
+                      Port is the TCP port of the external Redis master.
+                      Defaults to 6379 when not specified.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                required:
+                - host
+                type: object
               hostPort:
                 type: integer
               initContainer:

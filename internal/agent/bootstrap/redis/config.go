@@ -43,6 +43,8 @@ func GenerateConfig() error {
 		clusterMode        = util.CoalesceEnv1("SETUP_MODE", "standalone")
 		aclMode            = util.CoalesceEnv1("ACL_MODE", "")
 		aclFilePath        = util.CoalesceEnv1("ACL_FILE_PATH", "/etc/redis/user.acl")
+		externalMasterHost = util.CoalesceEnv1("EXTERNAL_MASTER_HOST", "")
+		externalMasterPort = util.CoalesceEnv1("EXTERNAL_MASTER_PORT", "6379")
 	)
 
 	if val, ok := util.CoalesceEnv("REDIS_PASSWORD", ""); ok && val != "" {
@@ -161,6 +163,21 @@ func GenerateConfig() error {
 	if maxMemory := util.CoalesceEnv1(consts.ENV_KEY_REDIS_MAX_MEMORY, ""); maxMemory != "" {
 		cfg.Append("maxmemory", maxMemory)
 	}
+
+	// External-master (slave-only) mode.
+	// When EXTERNAL_MASTER_HOST is set this Redis instance must come up as a
+	// read-only replica of the external master. `replicaof` is the Redis 5+
+	// preferred command; `masterauth` is already emitted above when
+	// REDIS_PASSWORD is set, and `tls-replication yes` is emitted in the TLS
+	// block above when TLS_MODE is true, so cross-cluster TLS replication
+	// works out-of-the-box.
+	if externalMasterHost != "" {
+		fmt.Println("Configuring Redis as a read-replica of external master",
+			externalMasterHost, externalMasterPort)
+		cfg.Append("replicaof", externalMasterHost+" "+externalMasterPort)
+		cfg.Append("replica-read-only", "yes")
+	}
+
 	// External configuration defined by user at the end
 	if _, err := os.Stat(externalConfigFile); err == nil {
 		cfg.Append("include", externalConfigFile)
